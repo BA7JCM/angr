@@ -31,6 +31,7 @@ from .presets import DECOMPILATION_PRESETS, DecompilationPreset
 if TYPE_CHECKING:
     from angr.knowledge_plugins.cfg.cfg_model import CFGModel
     from .peephole_optimizations import PeepholeOptimizationExprBase, PeepholeOptimizationStmtBase
+    from angr.analyses.typehoon.typevars import TypeVariable, TypeConstraint
 
 l = logging.getLogger(name=__name__)
 
@@ -135,6 +136,7 @@ class Decompiler(Analysis):
         self.unoptimized_ail_graph: networkx.DiGraph | None = None
         self.ail_graph: networkx.DiGraph | None = None
         self.vvar_id_start = None
+        self._copied_var_ids: set[int] = set()
         self._optimization_scratch: dict[str, Any] = {}
         self.expr_collapse_depth = expr_collapse_depth
 
@@ -267,6 +269,7 @@ class Decompiler(Analysis):
         self._variable_kb = clinic.variable_kb
         self._update_progress(70.0, text="Identifying regions")
         self.vvar_id_start = clinic.vvar_id_start
+        self._copied_var_ids = clinic.copied_var_ids
 
         if clinic.graph is None:
             # the function is empty
@@ -500,6 +503,8 @@ class Decompiler(Analysis):
                 scratch=self._optimization_scratch,
                 force_loop_single_exit=self._force_loop_single_exit,
                 complete_successors=self._complete_successors,
+                peephole_optimizations=self._peephole_optimizations,
+                avoid_vvar_ids=self._copied_var_ids,
                 **kwargs,
             )
 
@@ -545,7 +550,9 @@ class Decompiler(Analysis):
                     SimMemoryVariable(symbol.rebased_addr, 1, name=symbol.name, ident=ident),
                 )
 
-    def reflow_variable_types(self, type_constraints: set, func_typevar, var_to_typevar: dict, codegen):
+    def reflow_variable_types(
+        self, type_constraints: dict[TypeVariable, set[TypeConstraint]], func_typevar, var_to_typevar: dict, codegen
+    ):
         """
         Re-run type inference on an existing variable recovery result, then rerun codegen to generate new results.
 
@@ -605,7 +612,9 @@ class Decompiler(Analysis):
                     var = arg.variable
                     new_type = var_manager.get_variable_type(var)
                     if new_type is not None:
-                        self.func.prototype.args[i] = new_type
+                        self.func.prototype.args = (
+                            self.func.prototype.args[:i] + (new_type,) + self.func.prototype.args[i + 1 :]
+                        )
         except Exception:  # pylint:disable=broad-except
             l.warning(
                 "Typehoon analysis failed. Variables will not have types. Please report to GitHub.", exc_info=True

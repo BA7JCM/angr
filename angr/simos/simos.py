@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
 import logging
 import struct
 
@@ -13,6 +14,9 @@ from angr.calling_conventions import default_cc
 from angr.procedures import SIM_PROCEDURES as P
 from angr import sim_options as o
 from angr.storage.file import SimFileStream, SimFileBase
+
+if TYPE_CHECKING:
+    from angr.sim_procedure import SimProcedure
 
 
 _l = logging.getLogger(name=__name__)
@@ -46,7 +50,7 @@ class SimOS:
         self.unresolvable_call_target = self.project.loader.extern_object.allocate()
         self.project.hook(self.unresolvable_call_target, P["stubs"]["UnresolvableCallTarget"]())
 
-        def irelative_resolver(resolver_addr):
+        def irelative_resolver(resolver_addr: int) -> int | None:
             # autohooking runs before this does, might have provided this already
             # in that case, we want to advertise the _resolver_ address, since it is now
             # providing the behavior of the actual function
@@ -70,7 +74,7 @@ class SimOS:
                 _l.error("Resolver at %#x failed to resolve!", resolver_addr)
                 return None
 
-            return val.concrete_value
+            return val.concrete_value if val is not None and val.concrete else None
 
         self.project.loader.perform_irelative_relocs(irelative_resolver)
 
@@ -79,7 +83,7 @@ class SimOS:
 
         if sym is not None:
             addr, _ = self.prepare_function_symbol(name, basic_addr=sym.rebased_addr)
-            if self.project.is_hooked(addr) and not self.project.hooked_by(addr).is_stub:
+            if self.project.is_hooked(addr) and not self.project.hooked_by(addr).is_stub:  # type: ignore
                 return
             self.project.hook(addr, hook)
 
@@ -242,7 +246,7 @@ class SimOS:
         return self.state_entry(**kwargs)
 
     def state_call(self, addr, *args, **kwargs):
-        cc = kwargs.pop("cc", default_cc(self.arch.name, platform=self.name)(self.project.arch))
+        cc = kwargs.pop("cc", default_cc(self.arch.name, platform=self.name)(self.project.arch))  # type: ignore
         state = kwargs.pop("base_state", None)
         toc = kwargs.pop("toc", None)
 
@@ -326,22 +330,22 @@ class SimOS:
     # Dummy stuff to allow this API to be used freely
 
     # pylint: disable=unused-argument, no-self-use
-    def syscall(self, state, allow_unsupported=True):
+    def syscall(self, state: SimState, allow_unsupported: bool = True) -> SimProcedure | None:
         return None
 
-    def syscall_abi(self, state) -> str:
+    def syscall_abi(self, state: SimState) -> str | None:
         return None
 
-    def syscall_cc(self, state) -> angr.calling_conventions.SimCCSyscall | None:
+    def syscall_cc(self, state: SimState) -> angr.calling_conventions.SimCCSyscall | None:
         raise NotImplementedError
 
-    def is_syscall_addr(self, addr):
+    def is_syscall_addr(self, addr) -> bool:
         return False
 
-    def syscall_from_addr(self, addr, allow_unsupported=True):
+    def syscall_from_addr(self, addr, allow_unsupported=True) -> SimProcedure | None:
         return None
 
-    def syscall_from_number(self, number, allow_unsupported=True, abi=None):
+    def syscall_from_number(self, number, allow_unsupported=True, abi=None) -> SimProcedure | None:
         return None
 
     def setup_gdt(self, state, gdt):

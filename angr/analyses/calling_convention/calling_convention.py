@@ -165,6 +165,19 @@ class CallingConventionAnalysis(Analysis):
             ):
                 return
 
+            if (
+                hooker is not None
+                and hooker.cc is not None
+                and hooker.is_function
+                and not hooker.guessed_prototype
+                and hooker.prototype is not None
+            ):
+                # copy the calling convention and prototype from the SimProcedure instance
+                self.cc = hooker.cc
+                self.prototype = hooker.prototype
+                self.prototype_libname = hooker.library_name
+                return
+
             if self._function.prototype is None:
                 # try our luck
                 # we set ignore_binary_name to True because the binary name SimProcedures is "cle##externs" and does not
@@ -207,9 +220,9 @@ class CallingConventionAnalysis(Analysis):
                 self.prototype = prototype  # type: ignore
             return
         if self._function.is_plt:
-            r = self._analyze_plt()
-            if r is not None:
-                self.cc, self.prototype = r
+            r_plt = self._analyze_plt()
+            if r_plt is not None:
+                self.cc, self.prototype, self.prototype_libname = r_plt
             return
 
         r = self._analyze_function()
@@ -265,11 +278,11 @@ class CallingConventionAnalysis(Analysis):
         self.cc = cc
         self.prototype = prototype
 
-    def _analyze_plt(self) -> tuple[SimCC, SimTypeFunction | None] | None:
+    def _analyze_plt(self) -> tuple[SimCC, SimTypeFunction | None, str | None] | None:
         """
         Get the calling convention for a PLT stub.
 
-        :return:    A calling convention.
+        :return:    A calling convention, the function type, as well as the library name if available.
         """
         assert self._function is not None
 
@@ -309,14 +322,15 @@ class CallingConventionAnalysis(Analysis):
                 if self.project.is_hooked(real_func.addr):
                     # prioritize the hooker
                     hooker = self.project.hooked_by(real_func.addr)
-                    if hooker is not None and (
-                        not hooker.is_stub or (hooker.is_function and not hooker.guessed_prototype)
-                    ):
-                        return cc, hooker.prototype
+                    if hooker is not None and hooker.is_function and not hooker.guessed_prototype:
+                        # we only take the prototype from the SimProcedure if
+                        # - the SimProcedure is a function
+                        # - the prototype of the SimProcedure is not guessed
+                        return cc, hooker.prototype, hooker.library_name
                 if real_func.prototype is not None:
-                    return cc, real_func.prototype
+                    return cc, real_func.prototype, real_func.prototype_libname
             else:
-                return cc, real_func.prototype
+                return cc, real_func.prototype, real_func.prototype_libname
 
         if self.analyze_callsites:
             # determine the calling convention by analyzing its callsites
@@ -330,7 +344,7 @@ class CallingConventionAnalysis(Analysis):
             prototype = self._adjust_prototype(
                 prototype, callsite_facts, update_arguments=UpdateArgumentsOption.AlwaysUpdate
             )
-            return cc, prototype
+            return cc, prototype, None
 
         return None
 

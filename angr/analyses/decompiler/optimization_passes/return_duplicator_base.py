@@ -143,12 +143,25 @@ class ReturnDuplicatorBase:
         self._supergraph = to_ail_supergraph(graph)
         for region_head, (in_edges, region) in endnode_regions.items():
             is_single_const_ret_region = self._is_simple_return_graph(region)
+            dup_pred_nodes = []
+            # duplicate the entire region if at least (N-2) in-edges for the region head is deemed should be duplicated.
+            # otherwise we only duplicate the edges that should be duplicated
             for in_edge in in_edges:
                 pred_node = in_edge[0]
                 if self._should_duplicate_dst(
                     pred_node, region_head, graph, dst_is_const_ret=is_single_const_ret_region
                 ):
+                    dup_pred_nodes.append(pred_node)
+
+            dup_count = len(dup_pred_nodes)
+            dup_all = dup_count >= len(in_edges) - 2 > 0
+            if dup_all:
+                for pred_node in sorted((in_edge[0] for in_edge in in_edges), key=lambda x: x.addr):
                     # every eligible pred gets a new region copy
+                    self._copy_region([pred_node], region_head, region, graph)
+                    graph_changed = True
+            else:
+                for pred_node in dup_pred_nodes:
                     self._copy_region([pred_node], region_head, region, graph)
                     graph_changed = True
 
@@ -209,10 +222,10 @@ class ReturnDuplicatorBase:
 
         return end_node_regions
 
-    def _copy_region(self, pred_nodes, region_head, region, graph):
+    def _copy_region(self, pred_nodes: list[Block], region_head, region, graph):
         # copy the entire return region
         copies: dict[Block, Block] = {}
-        queue = [(pred_node, region_head) for pred_node in pred_nodes]
+        queue: list[tuple[Block, Block]] = [(pred_node, region_head) for pred_node in pred_nodes]
         vvar_mapping: dict[int, int] = {}
         while queue:
             pred, node = queue.pop(0)
@@ -234,12 +247,33 @@ class ReturnDuplicatorBase:
                 last_stmt = ConditionProcessor.get_last_statement(pred)
                 if isinstance(last_stmt, Jump):
                     if isinstance(last_stmt.target, Const) and last_stmt.target.value == node_copy.addr:
-                        last_stmt.target_idx = node_copy.idx
+                        updated_last_stmt = Jump(
+                            last_stmt.idx, last_stmt.target, target_idx=node_copy.idx, **last_stmt.tags
+                        )
+                        pred.statements[-1] = updated_last_stmt
                 elif isinstance(last_stmt, ConditionalJump):
                     if isinstance(last_stmt.true_target, Const) and last_stmt.true_target.value == node_copy.addr:
-                        last_stmt.true_target_idx = node_copy.idx
+                        updated_last_stmt = ConditionalJump(
+                            last_stmt.idx,
+                            last_stmt.condition,
+                            last_stmt.true_target,
+                            last_stmt.false_target,
+                            true_target_idx=node_copy.idx,
+                            false_target_idx=last_stmt.false_target_idx,
+                            **last_stmt.tags,
+                        )
+                        pred.statements[-1] = updated_last_stmt
                     elif isinstance(last_stmt.false_target, Const) and last_stmt.false_target.value == node_copy.addr:
-                        last_stmt.false_target_idx = node_copy.idx
+                        updated_last_stmt = ConditionalJump(
+                            last_stmt.idx,
+                            last_stmt.condition,
+                            last_stmt.true_target,
+                            last_stmt.false_target,
+                            true_target_idx=last_stmt.true_target_idx,
+                            false_target_idx=node_copy.idx,
+                            **last_stmt.tags,
+                        )
+                        pred.statements[-1] = updated_last_stmt
             except EmptyBlockNotice:
                 pass
 

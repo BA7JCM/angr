@@ -1,13 +1,20 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
+from collections import defaultdict
 
 import networkx
 
 from ailment import AILBlockWalker, Block
-from ailment.statement import ConditionalJump, Statement
+from ailment.statement import ConditionalJump, Statement, Assignment
 from ailment.expression import Const, BinaryOp, VirtualVariable
 
-from angr.analyses.decompiler.region_identifier import RegionIdentifier
+from angr.analyses.decompiler.utils import first_nonlabel_nonphi_statement
+from angr.utils.graph import dominates
+from angr.utils.timing import timethis
 from .optimization_pass import OptimizationPass, OptimizationPassStage
+
+if TYPE_CHECKING:
+    from angr.analyses.s_reaching_definitions import SRDAModel
 
 
 class ConstantCondition:
@@ -35,6 +42,7 @@ class CCondPropBlockWalker(AILBlockWalker):
         self._new_block: Block | None = None  # output
         self.vvar_id = vvar_id
         self.const_value = const_value
+        self.abort = False
 
     def walk(self, block: Block):
         self._new_block = None
@@ -42,6 +50,17 @@ class CCondPropBlockWalker(AILBlockWalker):
         return self._new_block
 
     def _handle_stmt(self, stmt_idx: int, stmt: Statement, block: Block):  # type: ignore
+        if self.abort:
+            return
+
+        if isinstance(stmt, Assignment) and isinstance(stmt.dst, VirtualVariable) and stmt.dst.varid == self.vvar_id:
+            # we see the assignment of this virtual variable; this is the original block that creates this variable
+            # and checks if this variable is equal to a constant value. as such, we stop processing this block.
+            # an example appears in binary 1de5cda760f9ed80bb6f4a35edcebc86ccec14c49cf4775ddf2ffc3e05ff35f4, function
+            # 0x4657C0, blocks 0x465bd6 and 0x465a5c
+            self.abort = True
+            return
+
         r = super()._handle_stmt(stmt_idx, stmt, block)
         if r is not None:
             # replace the original statement
@@ -52,7 +71,9 @@ class CCondPropBlockWalker(AILBlockWalker):
     def _handle_VirtualVariable(  # type: ignore
         self, expr_idx: int, expr: VirtualVariable, stmt_idx: int, stmt: Statement, block: Block | None
     ) -> Const | None:
-        if expr.varid == self.vvar_id:
+        if expr.varid == self.vvar_id and not (
+            isinstance(stmt, Assignment) and isinstance(stmt.dst, VirtualVariable) and stmt.dst.varid == self.vvar_id
+        ):
             return Const(expr.idx, None, self.const_value.value, self.const_value.bits, **expr.tags)
         return None
 
@@ -74,18 +95,9 @@ class ConditionConstantPropagation(OptimizationPass):
 
     def _check(self):
         cconds = self._find_const_conditions()
+
         if not cconds:
             return False, None
-        return True, {"cconds": cconds}
-
-    def _analyze(self, cache=None):
-        if not cache or cache.get("cconds", None) is None:  # noqa: SIM108
-            cconds = self._find_const_conditions()
-        else:
-            cconds = cache["cconds"]
-
-        if not cconds:
-            return
 
         # group cconds according to their sources
         cconds_by_src: dict[tuple[int, int | None], list[ConstantCondition]] = {}
@@ -95,26 +107,60 @@ class ConditionConstantPropagation(OptimizationPass):
                 cconds_by_src[src] = []
             cconds_by_src[src].append(ccond)
 
+        # eliminate conflicting conditions
+        for src in list(cconds_by_src):
+            cconds = cconds_by_src[src]
+            vvar_id_to_values = defaultdict(set)
+            ccond_dict = {}  # keyed by vvar_id; used for deduplication
+            for ccond in cconds:
+                vvar_id_to_values[ccond.vvar_id].add(ccond.value)
+                ccond_dict[ccond.vvar_id] = ccond
+            new_cconds = []
+            for vid, vvalues in vvar_id_to_values.items():
+                if len(vvalues) == 1:
+                    new_cconds.append(ccond_dict[vid])
+            if new_cconds:
+                cconds_by_src[src] = new_cconds
+            else:
+                del cconds_by_src[src]
+
+        if not cconds_by_src:
+            return False, None
+        return True, {"cconds_by_src": cconds_by_src}
+
+    @timethis
+    def _analyze(self, cache=None):
+        if not cache or cache.get("cconds_by_src", None) is None:
+            return
+        cconds_by_src = cache["cconds_by_src"]
+
+        if not cconds_by_src:
+            return
+
         # calculate a dominance frontier for each block
         entry_node_addr, entry_node_idx = self.entry_node_addr
         entry_node = self._get_block(entry_node_addr, idx=entry_node_idx)
-        df = networkx.algorithms.dominance_frontiers(self._graph, entry_node)
+        idoms = networkx.algorithms.immediate_dominators(self._graph, entry_node)
+        rda: SRDAModel = self.project.analyses.SReachingDefinitions(self._func, func_graph=self._graph).model
 
         for src, cconds in cconds_by_src.items():
             head_block = self._get_block(src[0], idx=src[1])
             if head_block is None:
                 continue
-            frontier = df.get(head_block)
-            if frontier is None:
-                continue
-            graph_slice = RegionIdentifier.slice_graph(self._graph, head_block, frontier, include_frontier=False)
-            for ccond in cconds:
-                walker = CCondPropBlockWalker(ccond.vvar_id, ccond.value)
-                for block in graph_slice:
-                    new_block = walker.walk(block)
-                    if new_block is not None:
-                        self._update_block(block, new_block)
 
+            for ccond in cconds:
+                for _, loc in rda.all_vvar_uses[ccond.vvar_id]:
+                    loc_block = self._get_block(loc.block_addr, idx=loc.block_idx)
+                    if loc_block is None:
+                        continue
+                    if dominates(idoms, head_block, loc_block):
+                        # the constant condition dominates the use site
+                        walker = CCondPropBlockWalker(ccond.vvar_id, ccond.value)
+                        new_block = walker.walk(loc_block)
+                        if new_block is not None:
+                            self._update_block(loc_block, new_block)
+
+    @timethis
     def _find_const_conditions(self) -> list[ConstantCondition]:
         cconds = []
 
@@ -122,28 +168,46 @@ class ConditionConstantPropagation(OptimizationPass):
             if block.statements:
                 last_stmt = block.statements[-1]
                 if (
-                    not isinstance(last_stmt, ConditionalJump)
-                    or not isinstance(last_stmt.true_target, Const)
-                    or not isinstance(last_stmt.false_target, Const)
+                    isinstance(last_stmt, ConditionalJump)
+                    and isinstance(last_stmt.true_target, Const)
+                    and isinstance(last_stmt.false_target, Const)
                 ):
-                    continue
+                    self._extract_const_condition_from_stmt(last_stmt, cconds)
+                else:
+                    # also check the first non-phi statement; rep stos may generate blocks whose conditional checks
+                    # are at the beginning of the block
 
-                if isinstance(last_stmt.condition, BinaryOp):
-                    cond = last_stmt.condition
-                    op = cond.op
-                    op0, op1 = cond.operands
-                    if isinstance(op0, Const):
-                        op0, op1 = op1, op0
-                    if isinstance(op0, VirtualVariable) and isinstance(op1, Const) and op1.is_int:
-                        if op == "CmpEQ":
-                            ccond = ConstantCondition(
-                                op0.varid, op1, last_stmt.true_target.value, last_stmt.true_target_idx  # type: ignore
-                            )
-                            cconds.append(ccond)
-                        elif op == "CmpNE":
-                            ccond = ConstantCondition(
-                                op0.varid, op1, last_stmt.false_target.value, last_stmt.false_target_idx  # type: ignore
-                            )
-                            cconds.append(ccond)
+                    # we could have used is_head_controlled_loop_block, but at this point the block is simplified enough
+                    # that the first non-label, non-phi statement must be a ConditionalJump that controls the execution
+                    # of the loop body, so the following logic should work fine.
+
+                    first_stmt = first_nonlabel_nonphi_statement(block)
+                    if (
+                        first_stmt is not last_stmt
+                        and isinstance(first_stmt, ConditionalJump)
+                        and isinstance(first_stmt.true_target, Const)
+                        and isinstance(first_stmt.false_target, Const)
+                    ):
+                        self._extract_const_condition_from_stmt(first_stmt, cconds)
 
         return cconds
+
+    @staticmethod
+    def _extract_const_condition_from_stmt(stmt: ConditionalJump, cconds: list[ConstantCondition]) -> None:
+        if isinstance(stmt.condition, BinaryOp):
+            cond = stmt.condition
+            op = cond.op
+            op0, op1 = cond.operands
+            if isinstance(op0, Const):
+                op0, op1 = op1, op0
+            if isinstance(op0, VirtualVariable) and isinstance(op1, Const) and op1.is_int:
+                if op == "CmpEQ":
+                    ccond = ConstantCondition(
+                        op0.varid, op1, stmt.true_target.value, stmt.true_target_idx  # type: ignore
+                    )
+                    cconds.append(ccond)
+                elif op == "CmpNE":
+                    ccond = ConstantCondition(
+                        op0.varid, op1, stmt.false_target.value, stmt.false_target_idx  # type: ignore
+                    )
+                    cconds.append(ccond)

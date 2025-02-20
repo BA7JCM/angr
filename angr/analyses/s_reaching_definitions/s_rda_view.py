@@ -185,7 +185,10 @@ class SRDAView:
                             vvars.append(func_arg)
         # there might be multiple vvars; we prioritize the one whose size fits the best
         for v in vvars:
-            if v.stack_offset == stack_offset and v.size == size:
+            if (
+                (v.was_stack and v.stack_offset == stack_offset)
+                or (v.was_parameter and v.parameter_stack_offset == stack_offset)
+            ) and v.size == size:
                 return v
         return vvars[0] if vvars else None
 
@@ -239,9 +242,9 @@ class SRDAView:
         return vvars[0] if vvars else None
 
     def get_vvar_value(self, vvar: VirtualVariable) -> Expression | None:
-        if vvar not in self.model.all_vvar_definitions:
+        if vvar.varid not in self.model.all_vvar_definitions:
             return None
-        codeloc = self.model.all_vvar_definitions[vvar]
+        codeloc = self.model.all_vvar_definitions[vvar.varid]
 
         for block in self.model.func_graph:
             if block.addr == codeloc.block_addr and block.idx == codeloc.block_idx:

@@ -1,3 +1,4 @@
+# pylint:disable=too-many-boolean-expressions
 from __future__ import annotations
 from collections.abc import Iterable
 import logging
@@ -7,6 +8,7 @@ import ailment
 
 from angr.calling_conventions import SimRegArg
 from angr.code_location import CodeLocation
+from angr.analyses.decompiler.stack_item import StackItem, StackItemType
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 
 
@@ -82,6 +84,14 @@ class RegisterSaveAreaSimplifier(OptimizationPass):
             # update it
             self._update_block(old_block, new_block)
 
+        if updated_blocks:
+            # update stack_items
+            for data in info.values():
+                for stack_offset, _ in data["stored"]:
+                    self.stack_items[stack_offset] = StackItem(
+                        stack_offset, self.project.arch.bytes, "regs", StackItemType.SAVED_REGS
+                    )
+
     def _find_registers_stored_on_stack(self) -> list[tuple[int, int, CodeLocation]]:
         first_block = self._get_block(self._func.addr)
         if first_block is None:
@@ -94,14 +104,26 @@ class RegisterSaveAreaSimplifier(OptimizationPass):
                 isinstance(stmt, ailment.Stmt.Store)
                 and isinstance(stmt.addr, ailment.Expr.StackBaseOffset)
                 and isinstance(stmt.addr.offset, int)
-                and isinstance(stmt.data, ailment.Expr.VirtualVariable)
-                and stmt.data.was_reg
             ):
-                # it's storing registers to the stack!
-                stack_offset = stmt.addr.offset
-                reg_offset = stmt.data.reg_offset
-                codeloc = CodeLocation(first_block.addr, idx, block_idx=first_block.idx, ins_addr=stmt.ins_addr)
-                results.append((reg_offset, stack_offset, codeloc))
+                if isinstance(stmt.data, ailment.Expr.VirtualVariable) and stmt.data.was_reg:
+                    # it's storing registers to the stack!
+                    stack_offset = stmt.addr.offset
+                    reg_offset = stmt.data.reg_offset
+                    codeloc = CodeLocation(first_block.addr, idx, block_idx=first_block.idx, ins_addr=stmt.ins_addr)
+                    results.append((reg_offset, stack_offset, codeloc))
+                elif (
+                    self.project.arch.name == "AMD64"
+                    and isinstance(stmt.data, ailment.Expr.Convert)
+                    and isinstance(stmt.data.operand, ailment.Expr.VirtualVariable)
+                    and stmt.data.operand.was_reg
+                    and stmt.data.from_bits == 256
+                    and stmt.data.to_bits == 128
+                ):
+                    # storing xmm registers to the stack
+                    stack_offset = stmt.addr.offset
+                    reg_offset = stmt.data.operand.reg_offset
+                    codeloc = CodeLocation(first_block.addr, idx, block_idx=first_block.idx, ins_addr=stmt.ins_addr)
+                    results.append((reg_offset, stack_offset, codeloc))
 
         return results
 

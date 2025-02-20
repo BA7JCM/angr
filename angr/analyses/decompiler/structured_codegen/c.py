@@ -40,7 +40,7 @@ from angr.sim_variable import SimVariable, SimTemporaryVariable, SimStackVariabl
 from angr.utils.constants import is_alignment_mask
 from angr.utils.library import get_cpp_function_name
 from angr.utils.loader import is_in_readonly_segment, is_in_readonly_section
-from angr.utils.types import unpack_typeref, unpack_pointer
+from angr.utils.types import unpack_typeref, unpack_pointer_and_array
 from angr.analyses.decompiler.utils import structured_node_is_simple_return
 from angr.errors import UnsupportedNodeTypeError, AngrRuntimeError
 from angr.knowledge_plugins.cfg.memory_data import MemoryData, MemoryDataSort
@@ -539,6 +539,8 @@ class CFunction(CConstruct):  # pylint:disable=abstract-method
 
         if self.codegen.show_externs and self.codegen.cexterns:
             for v in sorted(self.codegen.cexterns, key=lambda v: str(v.variable.name)):
+                if v.variable not in self.variables_in_use:
+                    continue
                 varname = v.c_repr() if v.type is None else v.variable.name
                 yield "extern ", None
                 yield from type_to_c_repr_chunks(v.type, name=varname, name_type=v, full=False)
@@ -2581,7 +2583,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
 
         # TODO store extern fallback size somewhere lol
         self.cexterns = {
-            self._variable(v, 1)
+            self._variable(v, 1, mark_used=False)
             for v in self.externs
             if v not in self._inlined_strings and v not in self._function_pointers
         }
@@ -2698,7 +2700,9 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
             return _mapping.get(n)(signed=signed).with_arch(self.project.arch)
         return SimTypeNum(n, signed=signed).with_arch(self.project.arch)
 
-    def _variable(self, variable: SimVariable, fallback_type_size: int | None, vvar_id: int | None = None) -> CVariable:
+    def _variable(
+        self, variable: SimVariable, fallback_type_size: int | None, vvar_id: int | None = None, mark_used: bool = True
+    ) -> CVariable:
         # TODO: we need to fucking make sure that variable recovery and type inference actually generates a size
         # TODO: for each variable it links into the fucking ail. then we can remove fallback_type_size.
         unified = self._variable_kb.variables[self._func.addr].unified_variable(variable)
@@ -2710,7 +2714,8 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
                 (fallback_type_size or self.project.arch.bytes) * self.project.arch.byte_width
             )
         cvar = CVariable(variable, unified_variable=unified, variable_type=variable_type, codegen=self, vvar_id=vvar_id)
-        self._variables_in_use[variable] = cvar
+        if mark_used:
+            self._variables_in_use[variable] = cvar
         return cvar
 
     def _get_variable_reference(self, cvar: CVariable) -> CExpression:
@@ -2776,7 +2781,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
         # expr must express a POINTER to the base
         # returns a value which has a simtype of data_type as if it were dereferenced out of expr
         data_type = unpack_typeref(data_type)
-        base_type = unpack_typeref(unpack_pointer(expr.type))
+        base_type = unpack_typeref(unpack_pointer_and_array(expr.type))
         if base_type is None:
             # well, not much we can do
             if data_type is None:
@@ -2899,7 +2904,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
     ) -> CExpression:
         # same rule as _access_constant_offset wrt pointer expressions
         data_type = unpack_typeref(data_type)
-        base_type = unpack_pointer(expr.type)
+        base_type = unpack_pointer_and_array(expr.type)
         if base_type is None:
             # use the fallback from above
             return self._access_constant_offset(expr, 0, data_type, lvalue, renegotiate_type)
@@ -2959,7 +2964,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
         kernel = None
         while i < len(terms):
             c, t = terms[i]
-            if isinstance(unpack_typeref(t.type), SimTypePointer):
+            if isinstance(unpack_typeref(t.type), (SimTypePointer, SimTypeArray)):
                 if kernel is not None:
                     l.warning("Summing two different pointers together. Uh oh!")
                     return bail_out()
@@ -2982,7 +2987,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
 
         # suffering.
         while terms:
-            kernel_type = unpack_typeref(unpack_pointer(kernel.type))
+            kernel_type = unpack_typeref(unpack_pointer_and_array(kernel.type))
             assert kernel_type
 
             if kernel_type.size is None:
@@ -3049,7 +3054,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
                     kernel = inner.operand
                 else:
                     kernel = CUnaryOp("Reference", inner, codegen=self)
-                if unpack_typeref(unpack_pointer(kernel.type)) == kernel_type:
+                if unpack_typeref(unpack_pointer_and_array(kernel.type)) == kernel_type:
                     # we are not making progress
                     pass
                 else:
