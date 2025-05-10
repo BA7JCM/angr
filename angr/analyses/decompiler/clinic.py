@@ -12,7 +12,6 @@ import networkx
 import capstone
 
 import ailment
-from angr import SIM_LIBRARIES, SIM_TYPE_COLLECTIONS
 
 from angr.errors import AngrDecompilationError
 from angr.knowledge_base import KnowledgeBase
@@ -22,9 +21,9 @@ from angr.knowledge_plugins.key_definitions import atoms
 from angr.codenode import BlockNode
 from angr.utils import timethis
 from angr.utils.graph import GraphUtils
+from angr.utils.types import dereference_simtype_by_lib
 from angr.calling_conventions import SimRegArg, SimStackArg, SimFunctionArgument
 from angr.sim_type import (
-    dereference_simtype,
     SimTypeChar,
     SimTypeInt,
     SimTypeLongLong,
@@ -1240,16 +1239,8 @@ class Clinic(Analysis):
                 # make sure the function prototype is resolved.
                 # TODO: Cache resolved function prototypes globally
                 prototype_libname = func.prototype_libname
-                type_collections = []
                 if prototype_libname is not None:
-                    for prototype_lib in SIM_LIBRARIES[prototype_libname]:
-                        if prototype_lib.type_collection_names:
-                            for typelib_name in prototype_lib.type_collection_names:
-                                type_collections.append(SIM_TYPE_COLLECTIONS[typelib_name])
-                if type_collections:
-                    prototype = dereference_simtype(prototype, type_collections).with_arch(  # type: ignore
-                        self.project.arch
-                    )
+                    prototype = dereference_simtype_by_lib(prototype, prototype_libname)
 
             if cc is None:
                 l.warning("Call site %#x (callee %s) has an unknown calling convention.", block.addr, repr(func))
@@ -1541,6 +1532,7 @@ class Clinic(Analysis):
             vvar_id_start=self.vvar_id_start,
         )
         self.vvar_id_start = ssailification.max_vvar_id + 1
+        assert ssailification.out_graph is not None
         return ssailification.out_graph
 
     @timethis
@@ -1834,7 +1826,13 @@ class Clinic(Analysis):
 
         # Unify SSA variables
         tmp_kb.variables.global_manager.assign_variable_names(labels=self.kb.labels, types={SimMemoryVariable})
-        var_manager.unify_variables()
+        liveness = self.project.analyses.SLiveness(
+            self.function,
+            func_graph=ail_graph,
+            entry=next(iter(bb for bb in ail_graph if (bb.addr, bb.idx) == self.entry_node_addr)),
+            arg_vvars=[vvar for vvar, _ in arg_vvars.values()],
+        )
+        var_manager.unify_variables(interference=liveness.interference_graph())
         var_manager.assign_unified_variable_names(
             labels=self.kb.labels,
             arg_names=self.function.prototype.arg_names if self.function.prototype else None,
@@ -1921,6 +1919,7 @@ class Clinic(Analysis):
                 self._link_variables_on_call(variable_manager, global_variables, block, stmt_idx, stmt, is_expr=False)
 
             elif stmt_type is ailment.Stmt.Return:
+                assert isinstance(stmt, ailment.Stmt.Return)
                 self._link_variables_on_return(variable_manager, global_variables, block, stmt_idx, stmt)
 
     def _link_variables_on_return(
@@ -2252,6 +2251,7 @@ class Clinic(Analysis):
     def _create_triangle_for_ite_expression(self, ail_graph, block_addr: int, ite_ins_addr: int):
         ite_insn_only_block = self.project.factory.block(ite_ins_addr, num_inst=1)
         ite_insn_size = ite_insn_only_block.size
+        assert ite_insn_size is not None
         if ite_insn_size <= 2:  # we need an address for true_block and another address for false_block
             return None
         if ite_insn_only_block.vex.exit_statements:
@@ -3205,7 +3205,7 @@ class Clinic(Analysis):
                         )
                         break
 
-        if alloca_node is not None:
+        if alloca_node is not None and sp_equal_to is not None:
             stmt0 = alloca_node.statements[1]
             statements = [ailment.Stmt.Call(stmt0.idx, "alloca", args=[sp_equal_to], **stmt0.tags)]
             new_node = ailment.Block(alloca_node.addr, alloca_node.original_size, statements=statements)
